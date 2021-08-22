@@ -1,0 +1,1721 @@
+From 4f318177f78342918e78de36143089d5ac14fa00 Mon Sep 17 00:00:00 2001
+From: nxf47746 <yili.xu@nxp.com>
+Date: Thu, 17 Oct 2019 15:39:00 +0800
+Subject: [PATCH] enable max9286 max96705 ar0144 module
+
+---
+ drivers/media/platform/imx8/Kconfig          |    6 +
+ drivers/media/platform/imx8/Makefile         |    1 +
+ drivers/media/platform/imx8/max9286-ar0144.c | 1651 ++++++++++++++++++
+ drivers/media/platform/imx8/mxc-isi-cap.c    |    8 +
+ 4 files changed, 1666 insertions(+)
+ create mode 100644 drivers/media/platform/imx8/max9286-ar0144.c
+
+diff --git a/drivers/media/platform/imx8/Kconfig b/drivers/media/platform/imx8/Kconfig
+index bf3a0a8e2850..e7a7939cf6bc 100644
+--- a/drivers/media/platform/imx8/Kconfig
++++ b/drivers/media/platform/imx8/Kconfig
+@@ -43,6 +43,12 @@ config GMSL_MAX9286
+         ---help---
+           If you plan to use the max9286 GMSL Deserializer with your capture system, say Y here.
+ 
++config MAX9286_AR0144
++        tristate "Maxim max9286 AR0144 Deserializer Input support"
++        depends on I2C
++        ---help---
++          If you plan to use the max9286 GMSL Deserializer with your capture system, say Y here.
++
+ config IMX8_JPEG
+ 	tristate "IMX8 JPEG Encoder/Decoder"
+ 	depends on VIDEO_V4L2 && VIDEO_V4L2_SUBDEV_API
+diff --git a/drivers/media/platform/imx8/Makefile b/drivers/media/platform/imx8/Makefile
+index 097a91b3c639..767e531a6cd5 100644
+--- a/drivers/media/platform/imx8/Makefile
++++ b/drivers/media/platform/imx8/Makefile
+@@ -9,6 +9,7 @@ obj-$(CONFIG_MXC_CAMERA_OV5640_V3) += ov5640_camera_v3.o
+ obj-$(CONFIG_MXC_CAMERA_OV5640_MIPI_V3) += ov5640_mipi_v3.o
+ max9286_gmsl-objs := max9286.o
+ obj-$(CONFIG_GMSL_MAX9286) += max9286_gmsl.o
++obj-$(CONFIG_MAX9286_AR0144) += max9286-ar0144.o
+ obj-$(CONFIG_IMX8_MEDIA_DEVICE) += mxc-media-dev.o
+ mxc-jpeg-enc-dec-objs := mxc-jpeg-hw.o mxc-jpeg.o
+ obj-$(CONFIG_IMX8_JPEG) += mxc-jpeg-enc-dec.o
+diff --git a/drivers/media/platform/imx8/max9286-ar0144.c b/drivers/media/platform/imx8/max9286-ar0144.c
+new file mode 100644
+index 000000000000..5500091c7015
+--- /dev/null
++++ b/drivers/media/platform/imx8/max9286-ar0144.c
+@@ -0,0 +1,1651 @@
++/*
++ * Copyright 2017-2018 NXP
++ */
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/ctype.h>
++#include <linux/types.h>
++#include <linux/delay.h>
++#include <linux/clk.h>
++#include <linux/of_device.h>
++#include <linux/i2c.h>
++#include <linux/v4l2-mediabus.h>
++#include <linux/of_gpio.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/regulator/consumer.h>
++#include <media/v4l2-subdev.h>
++
++
++#define MAX96705_MAX_SENSOR_NUM	4
++#define CAMERA_USES_15HZ
++
++#define ADDR_MAX9286		0x6A
++#define ADDR_MAX96705		0x40
++#define ADDR_MAX96705_ALL	(ADDR_MAX96705 + 5)  /* Broadcast address */
++
++#define MIPI_CSI2_SENS_VC0_PAD_SOURCE	0
++#define MIPI_CSI2_SENS_VC1_PAD_SOURCE	1
++#define MIPI_CSI2_SENS_VC2_PAD_SOURCE	2
++#define MIPI_CSI2_SENS_VC3_PAD_SOURCE	3
++#define MIPI_CSI2_SENS_VCX_PADS_NUM		4
++
++#define MAX_FPS		30
++#define MIN_FPS		15
++#define DEFAULT_FPS		30
++
++#define ADDR_AR0144_SENSOR	0x10
++#define ADDR_AP_SENSOR	0x5D
++
++/*!
++ * Maintains the information on the current state of the sesor.
++ */
++struct imxdpu_videomode {
++	char name[64];		/* may not be needed */
++
++	uint32_t pixelclock;	/* Hz */
++
++	/* htotal (pixels) = hlen + hfp + hsync + hbp */
++	uint32_t hlen;
++	uint32_t hfp;
++	uint32_t hbp;
++	uint32_t hsync;
++
++	/* field0 - vtotal (lines) = vlen + vfp + vsync + vbp */
++	uint32_t vlen;
++	uint32_t vfp;
++	uint32_t vbp;
++	uint32_t vsync;
++
++	/* field1  */
++	uint32_t vlen1;
++	uint32_t vfp1;
++	uint32_t vbp1;
++	uint32_t vsync1;
++
++	uint32_t flags;
++
++	uint32_t format;
++	uint32_t dest_format; /*buffer format for capture*/
++
++	int16_t clip_top;
++	int16_t clip_left;
++	uint16_t clip_width;
++	uint16_t clip_height;
++};
++
++struct sensor_data {
++	struct v4l2_subdev	subdev;
++	struct media_pad pads[MIPI_CSI2_SENS_VCX_PADS_NUM];
++	struct i2c_client *i2c_client;
++	struct v4l2_mbus_framefmt format;
++	struct v4l2_captureparm streamcap;
++	char running;
++
++	/* control settings */
++	int brightness;
++	int hue;
++	int contrast;
++	int saturation;
++	int red;
++	int green;
++	int blue;
++	int ae_mode;
++
++	u32 mclk;
++	u8 mclk_source;
++	struct clk *sensor_clk;
++	int v_channel;
++	bool is_mipi;
++	struct imxdpu_videomode cap_mode;
++
++	unsigned int sensor_num;       /* sensor num connect max96705 */
++	unsigned char sensor_is_there; /* Bit 0~3 for 4 cameras, 0b1= is there; 0b0 = is not there */
++	int pwn_gpio;
++};
++
++#define AR0144_REG_PID		0x300A
++#define AR0144_REG_VER		0x300B
++
++struct reg_value {
++	unsigned short reg_addr;
++	unsigned short val;
++	unsigned int delay_ms;
++};
++
++enum ar0144_mode {
++	ar0144_mode_MIN = 0,
++	ar0144_mode_WXGA_1280_800 = 0,
++	ar0144_mode_MAX = 0,
++};
++
++enum ar0144_frame_rate {
++	AR0144_30_FPS,
++};
++
++static int ar0144_framerates[] = {
++	[AR0144_30_FPS] = 30,
++};
++
++static struct reg_value ar0144_init_data[] = {
++	{ 0x301A, 0x00D9, 200 },
++	{ 0x301A, 0x30D8, 0 },
++	{ 0x3ED6, 0x3CB5, 0 },
++	{ 0x3ED8, 0x8765, 0 },
++	{ 0x3EDA, 0x8888, 0 },
++	{ 0x3EDC, 0x97FF, 0 },
++	{ 0x3EF8, 0x6522, 0 },
++	{ 0x3EFA, 0x2222, 0 },
++	{ 0x3EFC, 0x6666, 0 },
++	{ 0x3F00, 0xAA05, 0 },
++	{ 0x3EE2, 0x180E, 0 },
++	{ 0x3EE4, 0x0808, 0 },
++	{ 0x3EEA, 0x2A09, 0 },
++	{ 0x3060, 0x000e, 0 }, // analog gain
++	{ 0x305e, 0x0080, 0 }, // global gain
++	/* { 0x3100, 0x0001, 0 }, // auto exposure */
++	{ 0x3092, 0x00CF, 0 },
++	{ 0x3268, 0x0030, 0 },
++	{ 0x3786, 0x0006, 0 },
++	{ 0x3F4A, 0x0F70, 0 },
++	{ 0x306E, 0x4810, 0 },
++	{ 0x3064, 0x1802, 0 },
++	{ 0x3EF6, 0x804D, 0 },
++	{ 0x3180, 0xC08F, 0 },
++	{ 0x30BA, 0x7623, 0 },
++	{ 0x3176, 0x0480, 0 },
++	{ 0x3178, 0x0480, 0 },
++	{ 0x317A, 0x0480, 0 },
++	{ 0x317C, 0x0480, 0 },
++	{ 0x302A, 0x0006, 0 },
++	{ 0x302C, 0x0001, 0 },
++	{ 0x302E, 0x0004, 0 },
++	{ 0x3030, 0x0042, 0 },
++	{ 0x3036, 0x000C, 0 },
++	{ 0x3038, 0x0001, 0 },
++	{ 0x30B0, 0x0038, 100 },
++	{ 0x3002, 0x0000, 0 },
++	{ 0x3004, 0x0004, 0 },
++	{ 0x3006, 0x031F, 0 },
++	{ 0x3008, 0x0503, 0 },
++	{ 0x300A, 0x067A, 0 },
++	{ 0x300C, 0x05D0, 0 },
++	{ 0x3012, 0x033D, 0 },
++	{ 0x30A2, 0x0001, 0 },
++	{ 0x30A6, 0x0001, 0 },
++	{ 0x3040, 0x0000, 0 },
++	{ 0x31AE, 0x0200, 0 },
++	{ 0x3040, 0x0400, 0 },
++	{ 0x3040, 0x0C00, 0 },
++	{ 0x3064, 0x1882, 0 },
++	{ 0x3064, 0x1802, 0 },
++	{ 0x3028, 0x0010, 0 },
++	{ 0x301A, 0x30DC, 0 },
++	{ 0x3270, 0x0100, 0 },
++};
++
++struct ar0144_mode_info {
++	enum ar0144_mode mode;
++	u32 width;
++	u32 height;
++	struct reg_value *init_data_ptr;
++	u32 init_data_size;
++};
++
++static struct reg_value ar0144_setting_30fps_WXGA_1280_800[] = {
++	{ 0x0103, 0x01, 0 },
++	{ 0x0302, 0x30, 0 },
++	{ 0x030d, 0x60, 0 },
++	{ 0x030e, 0x06, 0 },
++	{ 0x3001, 0x62, 0 },
++	{ 0x3004, 0x01, 0 },
++	{ 0x3005, 0xff, 0 },
++	{ 0x3006, 0xe2, 0 },
++	{ 0x3011, 0x0a, 0 },
++	{ 0x3013, 0x18, 0 },
++	{ 0x301c, 0xf0, 0 },
++	{ 0x3022, 0x07, 0 },
++	{ 0x3030, 0x10, 0 },
++	{ 0x3039, 0x2e, 0 },
++	{ 0x303a, 0xf0, 0 },
++	{ 0x3500, 0x00, 0 },
++	{ 0x3501, 0x2a, 0 },
++	{ 0x3502, 0x90, 0 },
++	{ 0x3503, 0x08, 0 },
++	{ 0x3505, 0x8c, 0 },
++	{ 0x3507, 0x03, 0 },
++	{ 0x3508, 0x00, 0 },
++	{ 0x3509, 0x10, 0 },
++	{ 0x3610, 0x80, 0 },
++	{ 0x3611, 0xa0, 0 },
++	{ 0x3620, 0x6e, 0 },
++	{ 0x3632, 0x56, 0 },
++	{ 0x3633, 0x78, 0 },
++	{ 0x3662, 0x05, 0 },
++	{ 0x3666, 0x5a, 0 },
++	{ 0x366f, 0x7e, 0 },
++	{ 0x3680, 0x84, 0 },
++	{ 0x3712, 0x80, 0 },
++	{ 0x372d, 0x22, 0 },
++	{ 0x3731, 0x80, 0 },
++	{ 0x3732, 0x30, 0 },
++	{ 0x3778, 0x00, 0 },
++	{ 0x377d, 0x22, 0 },
++	{ 0x3788, 0x02, 0 },
++	{ 0x3789, 0xa4, 0 },
++	{ 0x378a, 0x00, 0 },
++	{ 0x378b, 0x4a, 0 },
++	{ 0x3799, 0x20, 0 },
++	{ 0x3800, 0x00, 0 },
++	{ 0x3801, 0x00, 0 },
++	{ 0x3802, 0x00, 0 },
++	{ 0x3803, 0x00, 0 },
++	{ 0x3804, 0x05, 0 },
++	{ 0x3805, 0x0f, 0 },
++	{ 0x3806, 0x03, 0 },
++	{ 0x3807, 0x2f, 0 },
++	{ 0x3808, 0x05, 0 },
++	{ 0x3809, 0x00, 0 },
++	{ 0x380a, 0x03, 0 },
++	{ 0x380b, 0x20, 0 },
++	{ 0x380c, 0x03, 0 },
++	{ 0x380d, 0x6b, 0 },
++	{ 0x380e, 0x05, 0 },
++	{ 0x380f, 0x5c, 0 },
++	{ 0x3810, 0x00, 0 },
++	{ 0x3811, 0x08, 0 },
++	{ 0x3812, 0x00, 0 },
++	{ 0x3813, 0x08, 0 },
++	{ 0x3814, 0x11, 0 },
++	{ 0x3815, 0x11, 0 },
++	{ 0x3820, 0x40, 0 },
++	{ 0x3821, 0x00, 0 },
++	{ 0x382c, 0x05, 0 },
++	{ 0x382d, 0xb0, 0 },
++	{ 0x389d, 0x00, 0 },
++	{ 0x3881, 0x42, 0 },
++	{ 0x3882, 0x01, 0 },
++	{ 0x3883, 0x00, 0 },
++	{ 0x3885, 0x02, 0 },
++	{ 0x38a8, 0x02, 0 },
++	{ 0x38a9, 0x80, 0 },
++	{ 0x38b1, 0x00, 0 },
++	{ 0x38b3, 0x02, 0 },
++	{ 0x38c4, 0x00, 0 },
++	{ 0x38c5, 0xc0, 0 },
++	{ 0x38c6, 0x04, 0 },
++	{ 0x38c7, 0x80, 0 },
++	{ 0x3920, 0xff, 0 },
++	{ 0x4003, 0x40, 0 },
++	{ 0x4008, 0x04, 0 },
++	{ 0x4009, 0x0b, 0 },
++	{ 0x400c, 0x00, 0 },
++	{ 0x400d, 0x07, 0 },
++	{ 0x4010, 0x40, 0 },
++	{ 0x4043, 0x40, 0 },
++	{ 0x4307, 0x30, 0 },
++	{ 0x4317, 0x01, 0 },
++	{ 0x4501, 0x00, 0 },
++	{ 0x4507, 0x00, 0 },
++	{ 0x4509, 0x00, 0 },
++	{ 0x450a, 0x08, 0 },
++	{ 0x4601, 0x04, 0 },
++	/* { //----- ----- 0 }, */
++	{ 0x4708, 0x0b, 0 },
++	/* { //----- ----- 0 }, */
++	{ 0x470f, 0xe0, 0 },
++	{ 0x4f07, 0x00, 0 },
++	{ 0x4800, 0x00, 0 },
++	{ 0x5000, 0x9f, 0 },
++	{ 0x5001, 0x00, 0 },
++	{ 0x5e00, 0x00, 0 },
++	{ 0x5d00, 0x0b, 0 },
++	{ 0x5d01, 0x02, 0 },
++	{ 0x4837, 0x1c, 0 },
++	{ 0x3006, 0xea, 0 },
++	{ 0x3210, 0x04, 0 },
++	{ 0x3007, 0x02, 0 },
++	{ 0x301c, 0xf0, 0 },
++	{ 0x3020, 0x20, 0 },
++	{ 0x3025, 0x02, 0 },
++	{ 0x3920, 0xff, 0 },
++	{ 0x3923, 0x00, 0 },
++	{ 0x3924, 0x00, 0 },
++	{ 0x3925, 0x00, 0 },
++	{ 0x3926, 0x00, 0 },
++	{ 0x3927, 0x00, 0 },
++	{ 0x3928, 0x80, 0 },
++	{ 0x392b, 0x00, 0 },
++	{ 0x392c, 0x00, 0 },
++	{ 0x392d, 0x02, 0 },
++	{ 0x392e, 0xd8, 0 },
++	{ 0x392f, 0xcb, 0 },
++	{ 0x38b3, 0x07, 0 },
++	{ 0x3885, 0x07, 0 },
++	{ 0x382b, 0x3a, 0 },
++	{ 0x3670, 0x68, 0 },
++	{ 0x3208, 0x00, 0 },
++	{ 0x3500, 0x00, 0 },
++	{ 0x3501, 0x51, 0 },
++	{ 0x3502, 0x40, 0 },
++	{ 0x3509, 0x40, 0 },
++	{ 0x380e, 0x05, 0 },
++	{ 0x380f, 0x5c, 0 },
++	{ 0x3927, 0x00, 0 },
++	{ 0x3928, 0xf0, 0 },
++	{ 0x3929, 0x00, 0 },
++	{ 0x392a, 0x41, 0 },
++	{ 0x3208, 0x10, 0 },
++	{ 0x3208, 0xa0, 0 },
++	{ 0x0100, 0x01, 0 },
++};
++
++static struct ar0144_mode_info ar0144_mode_info_data[1][ar0144_mode_MAX + 1] = {
++	/* 30fps */
++	{
++		{ ar0144_mode_WXGA_1280_800, 1280, 800,
++		  ar0144_setting_30fps_WXGA_1280_800,
++		  ARRAY_SIZE(ar0144_setting_30fps_WXGA_1280_800)
++		},
++	}
++};
++
++static inline struct sensor_data *subdev_to_sensor_data(struct v4l2_subdev *sd)
++{
++	return container_of(sd, struct sensor_data, subdev);
++}
++
++static enum ar0144_frame_rate to_ar0144_frame_rate(struct v4l2_fract *timeperframe)
++{
++	enum ar0144_frame_rate rate;
++	u32 tgt_fps;	/* target frames per secound */
++
++	tgt_fps = timeperframe->denominator / timeperframe->numerator;
++
++	if (tgt_fps == 30)
++		rate = AR0144_30_FPS;
++	else
++		rate = -EINVAL;
++
++	return rate;
++}
++
++static inline int ar0144_read_reg(struct sensor_data *max9286_data, int index,
++		unsigned short reg, unsigned short *val)
++{
++	unsigned char u8_buf[2] = { 0 };
++	unsigned int buf_len = 2;
++	int retry, timeout = 10;
++	unsigned char u8_val[2] ={ 0 };
++
++	u8_buf[0] = (reg >> 8) & 0xFF;
++	u8_buf[1] = reg & 0xFF;
++
++	max9286_data->i2c_client->addr = ADDR_AR0144_SENSOR + index;
++
++	for (retry = 0; retry < timeout; retry++) {
++		if (i2c_master_send(max9286_data->i2c_client, u8_buf, buf_len) < 0) {
++			dev_dbg(&max9286_data->i2c_client->dev,
++				"%s:read reg error on send: reg=0x%x, retry = %d.\n", __func__, reg, retry);
++			msleep(5);
++			continue;
++		}
++		if (i2c_master_recv(max9286_data->i2c_client, u8_val, 2) != 1) {
++			dev_dbg(&max9286_data->i2c_client->dev,
++				"%s:read reg error on recv: reg=0x%x, retry = %d.\n", __func__, reg, retry);
++			msleep(5);
++			continue;
++		}
++		break;
++	}
++
++	if (retry >= timeout) {
++		dev_info(&max9286_data->i2c_client->dev,
++			"%s:read reg error: reg=0x%x.\n", __func__, reg);
++		return -1;
++	}
++
++	*val = u8_val[0] | (u8_val[1] << 8);
++
++	return u8_val[0];
++}
++
++static inline int ar0144_write_reg(struct sensor_data *max9286_data, int index,
++		unsigned short reg, unsigned short val)
++{
++	unsigned char u8_buf[4] = { 0 };
++	unsigned int buf_len = 4;
++	int retry, timeout = 10;
++
++	u8_buf[0] = (reg >> 8) & 0xFF;
++	u8_buf[1] = reg & 0xFF;
++	u8_buf[2] = (val >> 8) & 0xff;
++	u8_buf[3] = val & 0xff;
++
++	max9286_data->i2c_client->addr = ADDR_AR0144_SENSOR + index;
++	for (retry = 0; retry < timeout; retry++) {
++		if (i2c_master_send(max9286_data->i2c_client, u8_buf, buf_len) < 0) {
++			dev_dbg(&max9286_data->i2c_client->dev,
++				"%s:write reg error: reg=0x%x, val=0x%x, retry = %d.\n", __func__, reg, val, retry);
++			msleep(5);
++			continue;
++		}
++		break;
++	}
++
++	if (retry >= timeout) {
++		dev_info(&max9286_data->i2c_client->dev,
++			"%s:write reg error: reg=0x%x, val=0x%x.\n", __func__, reg, val);
++		return -1;
++	}
++
++	return 0;
++}
++
++static int ar0144_check_device(struct sensor_data *max9286_data, int index)
++{
++	return 0;
++#if 0
++	unsigned char reg = 0;
++
++	ar0144_read_reg(max9286_data, index, AR0144_REG_PID, &reg);
++	if (reg != 0xA6) {
++		dev_err(&max9286_data->i2c_client->dev,
++			"%s: AR0144 hasn't been found, reg[0x%x] = 0x%x., index=%d\n",
++			__func__, AR0144_REG_PID, reg, index);
++		return -1;
++	}
++	ar0144_read_reg(max9286_data, index, AR0144_REG_VER, &reg);
++	if (reg != 0x35) {
++		dev_err(&max9286_data->i2c_client->dev,
++			"%s: AR0144 hasn't been found, reg[0x%x] = 0x%x.\n", __func__, AR0144_REG_VER, reg);
++		return -1;
++	}
++	dev_info(&max9286_data->i2c_client->dev, "%s: AR0144 index=%d was found.\n", __func__, index);
++
++	return 0;
++#endif
++}
++
++static int ar0144_download_firmware(struct sensor_data *max9286_data,
++			int index, struct reg_value *pModeSetting, s32 ArySize)
++{
++	register u32 Delay_ms = 0;
++	register u16 RegAddr = 0;
++	register u8 Val = 0;
++	int i, retval = 0;
++
++	for (i = 0; i < ArySize; ++i, ++pModeSetting) {
++		Delay_ms = pModeSetting->delay_ms;
++		RegAddr = pModeSetting->reg_addr;
++		Val = pModeSetting->val;
++
++		retval = ar0144_write_reg(max9286_data, index, RegAddr, Val);
++		if (retval < 0)
++			goto err;
++
++		if (Delay_ms)
++			msleep(Delay_ms);
++	}
++err:
++	return retval;
++}
++
++static int ar0144_initialize(struct sensor_data *max9286_data, int index)
++{
++	int i, array_size;
++	int retval;
++
++	dev_info(&max9286_data->i2c_client->dev, "%s: index = %d.\n", __func__, index);
++	array_size = ARRAY_SIZE(ar0144_init_data);
++	for (i = 0; i < array_size; i++) {
++		retval = ar0144_write_reg(max9286_data, index,
++					ar0144_init_data[i].reg_addr, ar0144_init_data[i].val);
++		if (retval < 0)
++			break;
++		if (ar0144_init_data[i].delay_ms != 0)
++			msleep(ar0144_init_data[i].delay_ms);
++	}
++
++	return 0;
++}
++
++static inline int max96705_read_reg(struct sensor_data *max9286_data, int index, u8 reg)
++{
++	int val;
++	int retry, timeout = 10;
++
++	max9286_data->i2c_client->addr = ADDR_MAX96705 + index;
++	for (retry = 0; retry < timeout; retry++) {
++		val = i2c_smbus_read_byte_data(max9286_data->i2c_client, reg);
++		if (val < 0)
++			msleep(5);
++		else
++			break;
++	}
++
++	if (retry >= timeout) {
++		dev_info(&max9286_data->i2c_client->dev,
++			"%s:read reg error: reg=%2x\n", __func__, reg);
++		return -1;
++	}
++
++	return val;
++}
++
++static int max96705_write_reg(struct sensor_data *max9286_data, int index, u8 reg, u8 val)
++{
++	s32 ret;
++	int retry, timeout = 10;
++
++	max9286_data->i2c_client->addr = ADDR_MAX96705 + index;
++	for (retry = 0; retry < timeout; retry++) {
++		ret = i2c_smbus_write_byte_data(max9286_data->i2c_client, reg, val);
++		if (val < 0)
++			msleep(5);
++		else
++			break;
++	}
++	dev_dbg(&max9286_data->i2c_client->dev,
++		"%s: addr %02x reg %02x val %02x\n",
++		__func__, max9286_data->i2c_client->addr, reg, val);
++
++	if (retry >= timeout) {
++		dev_info(&max9286_data->i2c_client->dev,
++			"%s:write reg error:reg=%2x,val=%2x\n", __func__,
++			reg, val);
++		return -1;
++	}
++
++	return 0;
++}
++
++/*! Read one register from a MAX9286 i2c slave device.
++ *
++ *  @param *reg		register in the device we wish to access.
++ *
++ *  @return		       0 if success, an error code otherwise.
++ */
++static inline int max9286_read_reg(struct sensor_data *max9286_data, u8 reg)
++{
++	int val;
++
++	max9286_data->i2c_client->addr = ADDR_MAX9286;
++	val = i2c_smbus_read_byte_data(max9286_data->i2c_client, reg);
++	if (val < 0) {
++		dev_info(&max9286_data->i2c_client->dev,
++			"%s:read reg error: reg=%2x\n", __func__, reg);
++		return -1;
++	}
++	return val;
++}
++
++/*! Write one register of a MAX9286 i2c slave device.
++ *
++ *  @param *reg		register in the device we wish to access.
++ *
++ *  @return		       0 if success, an error code otherwise.
++ */
++static int max9286_write_reg(struct sensor_data *max9286_data, u8 reg, u8 val)
++{
++	s32 ret;
++
++	max9286_data->i2c_client->addr = ADDR_MAX9286;
++	ret = i2c_smbus_write_byte_data(max9286_data->i2c_client, reg, val);
++
++	dev_dbg(&max9286_data->i2c_client->dev,
++		"%s:  addr %02x reg %02x val %02x\n",
++		__func__, max9286_data->i2c_client->addr, reg, val);
++
++	if (ret < 0) {
++		dev_info(&max9286_data->i2c_client->dev,
++			"%s:write reg error:reg=%2x,val=%2x\n", __func__,
++			reg, val);
++		return -1;
++	}
++	return 0;
++}
++
++#ifdef debug
++static void max96705_dump_registers(struct sensor_data *max9286_data, int index)
++{
++	unsigned char i;
++	printk("max96705_dump_registers: index = %d.\r\n", index);
++	for (i = 0; i < 0x20; i++)
++		printk("MAX96705 Reg 0x%02x = 0x%x.\r\n", i, max96705_read_reg(max9286_data, index, i));
++}
++
++static void max9286_dump_registers(struct sensor_data *max9286_data)
++{
++	unsigned char i;
++	printk("Dump MAX9286 registers:\r\n");
++	for (i = 0; i < 0x72; i++)
++		printk("MAX9286 Reg 0x%02x = 0x%x.\r\n", i, max9286_read_reg(max9286_data, i));
++}
++#else
++static void max96705_dump_registers(struct sensor_data *max9286_data, int index)
++{
++}
++#endif
++
++static void max9286_hw_reset(struct sensor_data *max9286_data)
++{
++	gpio_set_value(max9286_data->pwn_gpio, 0);
++	udelay(200);
++	gpio_set_value(max9286_data->pwn_gpio, 1);
++	msleep(1);
++}
++
++static int max9286_hardware_preinit(struct sensor_data *max9286_data)
++{
++	u8 reg;
++
++	dev_info(&max9286_data->i2c_client->dev, "In %s()\n", __func__);
++
++	/* return 0; */
++
++	/* Disable CSI Output */
++	max9286_write_reg(max9286_data, 0x15, 0x03);
++
++	/* Enable PRBS test */
++	max9286_write_reg(max9286_data, 0x0E, 0x5F);
++	msleep(10);
++
++#if 1
++	/* him high, bws:1*/
++	max9286_write_reg(max9286_data, 0x1c, 0xf5); // 1
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x0a, 0xff); // 2
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x34, 0x36); // 3
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x00, 0xe0); // 4
++	msleep(2);
++
++	/* Set RAW 12 bits mode, Double Data Rate, 4 data lane */
++	max9286_write_reg(max9286_data, 0x12, 0xF7); // 5
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x02, 0x00); // 6
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x63, 0x00); // 7
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x64, 0x00); // 8
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x06, 0x74); // 9
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x07, 0x4f); // 10
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x08, 0x2d); // 11
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x01, 0x00); // 12
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x0d, 0x03); // 13
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x69, 0x30); // 14
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x0c, 0x91); // 15
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x1b, 0x0f); // 16
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x32, 0xbb); // 17
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x33, 0xbb); // 18
++	msleep(2);
++
++	max9286_write_reg(max9286_data, 0x00, 0xef); /* STEP 14 */
++	max9286_write_reg(max9286_data, 0x34, 0xb6); /* STEP 14 */
++
++	max96705_write_reg(max9286_data, 0, 0x07, 0xa4);
++	msleep(2);
++
++	max96705_write_reg(max9286_data, 0, 0x67, 0xe7);  /* STEP 5 */
++	msleep(2);  /* STEP 6 */
++
++	max96705_write_reg(max9286_data, 0, 0x08, 0x01);  /* STEP 5 */
++	msleep(2);  /* STEP 6 */
++
++	//max96705_write_reg(max9286_data, 0, 0x97, 0xaf);  /* STEP 5 */
++	msleep(2);  /* STEP 6 */
++
++	max96705_write_reg(max9286_data, 0, 0x04, 0x47);  /* STEP 5 */
++	msleep(2);  /* STEP 6 */
++
++	max9286_write_reg(max9286_data, 0x34, 0x36); /* STEP 14 */
++	msleep(2);  /* STEP 6 */
++#endif
++
++#if 0
++	/* Enable Custom Reverse Channel & First Pulse Length  STEP 1 */
++	max9286_write_reg(max9286_data, 0x3F, 0x4F);
++	msleep(2); /* STEP 2 */
++
++	/* Reverse Channel Amplitude to mid level and transition time */
++	max9286_write_reg(max9286_data, 0x3B, 0x1E); /* STEP 3 */
++	msleep(2); /* STEP 4 */
++
++	/* Enable MAX96705 Configuration Link */
++	max96705_write_reg(max9286_data, 0, 0x04, 0x43);  /* STEP 5 */
++	msleep(2);  /* STEP 6 */
++
++	/* Increase serializer reverse channel input thresholds */
++	max96705_write_reg(max9286_data, 0, 0x08, 0x01);  /* STEP 7 */
++	msleep(2);  /* STEP 8 */
++
++	max96705_write_reg(max9286_data, 0, 0x97, 0xaf); /* step 7a */
++	msleep(2);
++
++	/* Reverse Channel Amplitude level */
++	//max9286_write_reg(max9286_data, 0x3B, 0x19);  /* STEP 9 */
++	msleep(5);  /* STEP 10 */
++
++	/* Set RAW 10 bits mode, Double Data Rate, 4 data lane */
++	max9286_write_reg(max9286_data, 0x12, 0xF6); /* STEP 12 */
++
++	max9286_write_reg(max9286_data, 0x01, 0x02); /* STEP 13 */
++	/* Enable All Link 0-3  */
++	max9286_write_reg(max9286_data, 0x00, 0xef); /* STEP 14 */
++
++	/* Frame Sync */
++	/* Automatic Mode */
++	max9286_write_reg(max9286_data, 0x01, 0x02);/* STEP 13 */
++	msleep(200);
++#endif
++	/* Detect link */
++	max9286_data->sensor_num = 0;
++	reg = max9286_read_reg(max9286_data, 0x49);
++	max9286_data->sensor_is_there = ((reg >> 4) & 0xF) | (reg & 0xF);
++	if (max9286_data->sensor_is_there & (0x1 << 0))
++		max9286_data->sensor_num += 1;
++	if (max9286_data->sensor_is_there & (0x1 << 1))
++		max9286_data->sensor_num += 1;
++	if (max9286_data->sensor_is_there & (0x1 << 2))
++		max9286_data->sensor_num += 1;
++	if (max9286_data->sensor_is_there & (0x1 << 3))
++		max9286_data->sensor_num += 1;
++	pr_info("max9286_mipi: reg = 0x%02x.\n", reg);
++	pr_info("max9286_mipi: sensor number = %d.\n", max9286_data->sensor_num);
++
++	if (max9286_data->sensor_num == 0) {
++		pr_err("%s: no camera connected.\n", __func__);
++		return -1;
++	}
++	return 0;
++
++}
++
++static void max9286_camera_reorder(struct sensor_data *max9286_data)
++{
++	u8 reg;
++
++	reg = 0xE4;
++	if (max9286_data->sensor_num == 1) {
++		switch (max9286_data->sensor_is_there) {
++		case 0x8:
++			reg = 0x27;
++			break;
++		case 0x4:
++			reg = 0xC6;
++			break;
++		case 0x2:
++			reg = 0xE1;
++			break;
++		case 0x1:
++		default:
++			reg = 0xE4;
++			break;
++		}
++	} else if (max9286_data->sensor_num == 2) {
++		switch (max9286_data->sensor_is_there) {
++		case 0xC:
++			reg = 0x4E;
++			break;
++		case 0xA:
++			reg = 0x72;
++			break;
++		case 0x9:
++			reg = 0x78;
++			break;
++		case 0x6:
++			reg = 0xD2;
++			break;
++		case 0x5:
++			reg = 0xD8;
++			break;
++		case 0x3:
++		default:
++			reg = 0xE4;
++			break;
++		}
++	} else if (max9286_data->sensor_num == 3) {
++		switch (max9286_data->sensor_is_there) {
++		case 0xE:
++			reg = 0x93;
++			break;
++		case 0xD:
++			reg = 0x9C;
++			break;
++		case 0xB:
++			reg = 0xB4;
++			break;
++		case 0x7:
++		default:
++			reg = 0xE4;
++			break;
++		}
++	}
++	max9286_write_reg(max9286_data, 0x0B, reg);
++}
++
++static int max9286_hardware_init(struct sensor_data *max9286_data)
++{
++	int retval = 0;
++	int i;
++	u8 reg, sensor_addr = 0;
++
++	dev_info(&max9286_data->i2c_client->dev, "In %s()\n", __func__);
++
++	/* Disable PRBS test */
++	max9286_write_reg(max9286_data, 0x0E, 0x50);
++
++	/* reorder camera */
++	max9286_camera_reorder(max9286_data);
++
++	/* Enable all links */
++	reg = 0xE0 | max9286_data->sensor_is_there;
++	max9286_write_reg(max9286_data, 0x00, reg);
++
++	/* Set up links */
++	sensor_addr = ADDR_AR0144_SENSOR;
++	/* max96705_write_reg(max9286_data, 0, 0x07, 0xa4); */
++
++	/* cross bar switch
++	 * reverve data[0:11] mapping
++	 */
++	for (i = 0; i < 12; i ++) {
++		max96705_write_reg(max9286_data, 0, 0x20 + i, 0xb - i);
++		max96705_write_reg(max9286_data, 0, 0x30 + i, 0x1b - i);
++	}
++
++	/* STEP 15-46 */
++	reg = 0;
++	for (i = 1; i <= MAX96705_MAX_SENSOR_NUM; i++) {
++		if (((0x1 << (i - 1)) & max9286_data->sensor_is_there) == 0)
++			continue;
++
++		/* Enable Link control channel */
++		reg |= (0x11 << (i - 1));
++		max9286_write_reg(max9286_data, 0x0A, reg);/* STEP 15 */
++
++		/* Set MAX96705 new address for link 0 */
++		max96705_write_reg(max9286_data, 0, 0x00, (ADDR_MAX96705 + i) << 1);
++		msleep(2);
++
++		max96705_write_reg(max9286_data, i, 0x01, ADDR_MAX9286 << 1);
++		max96705_write_reg(max9286_data, i, 0x09, (sensor_addr + i) << 1);
++		max96705_write_reg(max9286_data, i, 0x0A, sensor_addr << 1);
++		max96705_write_reg(max9286_data, i, 0x0B, ADDR_MAX96705_ALL << 1);
++		max96705_write_reg(max9286_data, i, 0x0C, (ADDR_MAX96705 + i) << 1);
++
++		msleep(1);
++		pr_info("max9286_mipi: initialized sensor  = 0x%02x.\n", i);
++		max96705_dump_registers(max9286_data, i);
++	}
++	max9286_write_reg(max9286_data, 0x0A, reg);
++	max9286_write_reg(max9286_data, 0x0A, reg);
++
++	/* Disable Local Auto I2C ACK */
++	max9286_write_reg(max9286_data, 0x34, 0x36); /* STEP 48 */
++
++	/* Initialize Camera Sensor */
++	/* STEP 49 */
++	if (max9286_data->sensor_is_there & (0x1 << 0)) {
++		retval = ar0144_check_device(max9286_data, 1);
++		if (retval < 0)
++			return retval;
++		ar0144_initialize(max9286_data, 0);
++	}
++
++	if (max9286_data->sensor_is_there & (0x1 << 1)) {
++		retval = ar0144_check_device(max9286_data, 2);
++		if (retval < 0)
++			return retval;
++		ar0144_initialize(max9286_data, 1);
++	}
++
++	if (max9286_data->sensor_is_there & (0x1 << 2)) {
++		retval = ar0144_check_device(max9286_data, 3);
++		if (retval < 0)
++			return retval;
++		ar0144_initialize(max9286_data, 2);
++	}
++
++	if (max9286_data->sensor_is_there & (0x1 << 3)) {
++		retval = ar0144_check_device(max9286_data, 4);
++		if (retval < 0)
++			return retval;
++		ar0144_initialize(max9286_data, 3);
++	}
++
++	/* Enable Local Auto I2C ACK */
++	max9286_write_reg(max9286_data, 0x34, 0xB6); /* STEP 50 */
++
++	/* MAX96705: Enable Serial Links and Disable Configuration Link */
++	max96705_write_reg(max9286_data, ADDR_MAX96705_ALL - ADDR_MAX96705, 0x04, 0x83); /* STEP 51 */
++	/* Wait for more than 2 frame time */
++	msleep(1000); /* STEP 52 */
++
++	/* Enable CSI output, set virtual channel according to the link number */
++	max9286_write_reg(max9286_data, 0x15, 0x9B); /* STEP 52 */
++	msleep(10);
++	return retval;
++}
++
++static int ar0144_change_mode(struct sensor_data *max9286_data)
++{
++#if 0
++	struct reg_value *pModeSetting = NULL;
++	enum ar0144_mode mode = max9286_data->streamcap.capturemode;
++	enum ar0144_frame_rate rate =
++				to_ar0144_frame_rate(&max9286_data->streamcap.timeperframe);
++	int ArySize = 0, retval = 0;
++
++	if (mode > ar0144_mode_MAX || mode < ar0144_mode_MIN) {
++		pr_err("Wrong ar0144 mode detected!\n");
++		return -1;
++	}
++
++	pModeSetting = ar0144_mode_info_data[rate][mode].init_data_ptr;
++	ArySize = ar0144_mode_info_data[rate][mode].init_data_size;
++
++	max9286_data->format.width = ar0144_mode_info_data[rate][mode].width;
++	max9286_data->format.height = ar0144_mode_info_data[rate][mode].height;
++
++	if (max9286_data->format.width == 0 ||
++		max9286_data->format.height == 0 ||
++	    pModeSetting == NULL || ArySize == 0) {
++		pr_err("Not support mode=%d %s\n", mode,
++						(rate == 0) ? "15(fps)" : "30(fps)");
++		return -EINVAL;
++	}
++
++	retval = ar0144_download_firmware(max9286_data, 0, pModeSetting, ArySize);
++
++	return retval;
++#endif
++	return 0;
++}
++
++static int max9286_g_parm(struct v4l2_subdev *sd, struct v4l2_streamparm *a)
++{
++	struct v4l2_captureparm *cparm = &a->parm.capture;
++	struct sensor_data *max9286_data = subdev_to_sensor_data(sd);
++	int ret = 0;
++
++	switch (a->type) {
++	/* This is the only case currently handled. */
++	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
++	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
++		memset(a, 0, sizeof(*a));
++		a->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++		cparm->capability = max9286_data->streamcap.capability;
++		cparm->timeperframe = max9286_data->streamcap.timeperframe;
++		cparm->capturemode = max9286_data->streamcap.capturemode;
++		ret = 0;
++		break;
++
++	/* These are all the possible cases. */
++	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
++	case V4L2_BUF_TYPE_VIDEO_OVERLAY:
++	case V4L2_BUF_TYPE_VBI_CAPTURE:
++	case V4L2_BUF_TYPE_VBI_OUTPUT:
++	case V4L2_BUF_TYPE_SLICED_VBI_CAPTURE:
++	case V4L2_BUF_TYPE_SLICED_VBI_OUTPUT:
++		ret = -EINVAL;
++		break;
++	default:
++		pr_debug("   type is unknown - %d\n", a->type);
++		ret = -EINVAL;
++		break;
++	}
++
++	return ret;
++}
++
++/*!
++ * ioctl_s_parm - V4L2 sensor interface handler for VIDIOC_S_PARM ioctl
++ * @s: pointer to standard V4L2 device structure
++ * @a: pointer to standard V4L2 VIDIOC_S_PARM ioctl structure
++ *
++ * Configures the sensor to use the input parameters, if possible.  If
++ * not possible, reverts to the old parameters and returns the
++ * appropriate error code.
++ */
++static int max9286_s_parm(struct v4l2_subdev *sd, struct v4l2_streamparm *a)
++{
++	struct sensor_data *max9286_data = subdev_to_sensor_data(sd);
++	struct v4l2_fract *timeperframe = &a->parm.capture.timeperframe;
++	enum ar0144_frame_rate frame_rate;
++	enum ar0144_mode mode = a->parm.capture.capturemode;
++	u32 tgt_fps;
++	int ret = 0;
++
++	switch (a->type) {
++	/* This is the only case currently handled. */
++	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
++	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
++		/* Check that the new frame rate is allowed. */
++		if ((timeperframe->numerator == 0) ||
++		    (timeperframe->denominator == 0)) {
++			timeperframe->denominator = DEFAULT_FPS;
++			timeperframe->numerator = 1;
++		}
++
++		tgt_fps = timeperframe->denominator /
++			  timeperframe->numerator;
++
++		if (tgt_fps > MAX_FPS) {
++			timeperframe->denominator = MAX_FPS;
++			timeperframe->numerator = 1;
++		} else if (tgt_fps < MIN_FPS) {
++			timeperframe->denominator = MIN_FPS;
++			timeperframe->numerator = 1;
++		}
++
++		/* Actual frame rate we use */
++		tgt_fps = timeperframe->denominator /
++			  timeperframe->numerator;
++
++		if (tgt_fps == 30)
++			frame_rate = AR0144_30_FPS;
++		else
++			frame_rate = -EINVAL;
++
++		if (frame_rate != AR0144_30_FPS ) {
++			pr_err(" The camera %d frame rate is not supported!\n", frame_rate);
++			return -EINVAL;
++		}
++
++		if (mode > ar0144_mode_MAX || mode < ar0144_mode_MIN) {
++			pr_err("The camera mode[%d] is not supported!\n", mode);
++			return -EINVAL;
++		}
++
++		max9286_data->streamcap.timeperframe = *timeperframe;
++		max9286_data->streamcap.capturemode = a->parm.capture.capturemode;
++		max9286_data->format.reserved[0] = 72 * 8;
++		break;
++
++	/* These are all the possible cases. */
++	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
++	case V4L2_BUF_TYPE_VIDEO_OVERLAY:
++	case V4L2_BUF_TYPE_VBI_CAPTURE:
++	case V4L2_BUF_TYPE_VBI_OUTPUT:
++	case V4L2_BUF_TYPE_SLICED_VBI_CAPTURE:
++	case V4L2_BUF_TYPE_SLICED_VBI_OUTPUT:
++		pr_debug("   type is not "\
++				 "V4L2_BUF_TYPE_VIDEO_CAPTURE but %d\n",
++			a->type);
++		ret = -EINVAL;
++		break;
++
++	default:
++		pr_debug("   type is unknown - %d\n", a->type);
++		ret = -EINVAL;
++		break;
++	}
++
++	return ret;
++}
++
++static int max9286_enum_mbus_code(struct v4l2_subdev *sd,
++				struct v4l2_subdev_pad_config *cfg,
++				struct v4l2_subdev_mbus_code_enum *code)
++{
++	struct sensor_data *max9286_data = subdev_to_sensor_data(sd);
++
++	code->code = max9286_data->format.code;
++	return 0;
++}
++
++/*!
++ * max9286_enum_framesizes - V4L2 sensor interface handler for
++ *			   VIDIOC_ENUM_FRAMESIZES ioctl
++ * @s: pointer to standard V4L2 device structure
++ * @fsize: standard V4L2 VIDIOC_ENUM_FRAMESIZES ioctl structure
++ *
++ * Return 0 if successful, otherwise -EINVAL.
++ */
++static int max9286_enum_framesizes(struct v4l2_subdev *sd,
++			       struct v4l2_subdev_pad_config *cfg,
++			       struct v4l2_subdev_frame_size_enum *fse)
++{
++	if (fse->index > ar0144_mode_MAX)
++		return -EINVAL;
++
++	fse->max_width = ar0144_mode_info_data[0][fse->index].width;
++	fse->min_width = fse->max_width;
++
++	fse->max_height = ar0144_mode_info_data[0][fse->index].height;
++	fse->min_height = fse->max_height;
++
++	return 0;
++}
++static int max9286_enum_frame_interval(struct v4l2_subdev *sd,
++				   struct v4l2_subdev_pad_config *cfg,
++				   struct v4l2_subdev_frame_interval_enum *fie)
++{
++	int i, j, count;
++
++	if (fie->index < 0 || fie->index > ar0144_mode_MAX)
++		return -EINVAL;
++
++	if (fie->width == 0 || fie->height == 0 ||
++	    fie->code == 0) {
++		pr_warning("Please assign pixel format, width and height.\n");
++		return -EINVAL;
++	}
++
++	fie->interval.numerator = 1;
++
++	 /* TODO Reserved to extension */
++	count = 0;
++	for (i = 0; i < ARRAY_SIZE(ar0144_framerates); i++) {
++		for (j = 0; j < (ar0144_mode_MAX + 1); j++) {
++			if (fie->width == ar0144_mode_info_data[i][j].width
++			 && fie->height == ar0144_mode_info_data[i][j].height
++			 && ar0144_mode_info_data[i][j].init_data_ptr != NULL) {
++				count++;
++			}
++			if (fie->index == (count - 1)) {
++				fie->interval.denominator = ar0144_framerates[i];
++				return 0;
++			}
++		}
++	}
++
++	return -EINVAL;
++}
++
++static int max9286_get_fmt(struct v4l2_subdev *sd,
++			   struct v4l2_subdev_pad_config *cfg,
++			   struct v4l2_subdev_format *fmt)
++{
++	struct sensor_data *max9286_data = subdev_to_sensor_data(sd);
++	struct v4l2_mbus_framefmt *mf = &fmt->format;
++
++	if (fmt->pad)
++		return -EINVAL;
++
++	mf->code = max9286_data->format.code;
++	mf->width =  max9286_data->format.width;
++	mf->height = max9286_data->format.height;
++	mf->colorspace = max9286_data->format.colorspace;
++	mf->field = max9286_data->format.field;
++	mf->reserved[0] = max9286_data->format.reserved[0];
++
++	return 0;
++}
++
++static struct ar0144_mode_info *get_max_resolution(enum ar0144_frame_rate rate)
++{
++	u32 max_width;
++	enum ar0144_mode mode;
++	int i;
++
++	mode = 0;
++	max_width  = ar0144_mode_info_data[rate][0].width;
++
++	for (i = 0; i < (ar0144_mode_MAX + 1); i++) {
++		if (ar0144_mode_info_data[rate][i].width > max_width) {
++			max_width = ar0144_mode_info_data[rate][i].width;
++			mode = i;
++		}
++	}
++	return &ar0144_mode_info_data[rate][mode];
++}
++
++static struct ar0144_mode_info *match(struct v4l2_mbus_framefmt *fmt,
++			enum ar0144_frame_rate rate)
++{
++	struct ar0144_mode_info *info;
++	int i;
++
++	for (i = 0; i < (ar0144_mode_MAX + 1); i++) {
++		if (fmt->width == ar0144_mode_info_data[rate][i].width &&
++			fmt->height == ar0144_mode_info_data[rate][i].height) {
++			info = &ar0144_mode_info_data[rate][i];
++			break;
++		}
++	}
++	if (i == ar0144_mode_MAX + 1)
++		info = NULL;
++
++	return info;
++}
++
++static void try_to_find_resolution(struct sensor_data *sensor,
++			struct v4l2_mbus_framefmt *mf)
++{
++	enum ar0144_mode mode = sensor->streamcap.capturemode;
++	struct v4l2_fract *timeperframe = &sensor->streamcap.timeperframe;
++	enum ar0144_frame_rate frame_rate = to_ar0144_frame_rate(timeperframe);
++	struct device *dev = &sensor->i2c_client->dev;
++	struct ar0144_mode_info *info;
++	bool found = false;
++
++	/* printk("%s:%d mode=%d, frame_rate=%d, w/h=(%d,%d)\n", __func__, __LINE__, */
++				/* mode, frame_rate, mf->width, mf->height); */
++
++	if ((mf->width == ar0144_mode_info_data[frame_rate][mode].width) &&
++		(mf->height == ar0144_mode_info_data[frame_rate][mode].height)) {
++			info = &ar0144_mode_info_data[frame_rate][mode];
++			found = true;
++	} else {
++		/* get mode info according to frame user's width and height */
++		info = match(mf, frame_rate);
++		if (info == NULL) {
++			frame_rate ^= 0x1;
++			info = match(mf, frame_rate);
++			if (info) {
++				sensor->streamcap.capturemode = -1;
++				dev_err(dev, "%s %dx%d only support %s(fps)\n", __func__,
++						info->width, info->height,
++						(frame_rate == 0) ? "15fps" : "30fps");
++				return;
++			}
++			goto max_resolution;
++		}
++		found = true;
++	}
++
++	/* get max resolution to resize */
++max_resolution:
++	if (!found) {
++		frame_rate ^= 0x1;
++		info = get_max_resolution(frame_rate);
++	}
++
++	/*printk("%s:%d mode=%d, frame_rate=%d, w/h=(%d,%d)\n", __func__, __LINE__,*/
++				/*mode, frame_rate, mf->width, mf->height);*/
++
++	sensor->streamcap.capturemode = info->mode;
++	sensor->streamcap.timeperframe.denominator = 30;
++	sensor->format.width  = info->width;
++	sensor->format.height = info->height;
++}
++
++static int max9286_set_fmt(struct v4l2_subdev *sd,
++			 struct v4l2_subdev_pad_config *cfg,
++			 struct v4l2_subdev_format *fmt)
++{
++	struct sensor_data *max9286_data = subdev_to_sensor_data(sd);
++	struct v4l2_mbus_framefmt *mf = &fmt->format;
++	int ret;
++
++	if (fmt->pad)
++		return -EINVAL;
++
++	mf->code = max9286_data->format.code;
++	mf->colorspace = max9286_data->format.colorspace;
++	mf->field = V4L2_FIELD_NONE;
++
++	try_to_find_resolution(max9286_data, mf);
++
++	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
++		return 0;
++
++	ret = ar0144_change_mode(max9286_data);
++
++	return ret;
++}
++
++static int max9286_get_frame_desc(struct v4l2_subdev *sd, unsigned int pad,
++				  struct v4l2_mbus_frame_desc *fd)
++{
++	return 0;
++}
++
++static int max9286_set_frame_desc(struct v4l2_subdev *sd,
++					unsigned int pad,
++					struct v4l2_mbus_frame_desc *fd)
++{
++	return 0;
++}
++
++static int max9286_set_power(struct v4l2_subdev *sd, int on)
++{
++	return 0;
++}
++
++static int max9286_s_stream(struct v4l2_subdev *sd, int enable)
++{
++	struct sensor_data *max9286_data = subdev_to_sensor_data(sd);
++
++	dev_dbg(sd->dev, "%s\n", __func__);
++	if (enable) {
++		if (!max9286_data->running) {
++			/* Enable CSI output, set virtual channel according to the link number */
++			max9286_write_reg(max9286_data, 0x15, 0x9B);
++		}
++		max9286_data->running++;
++
++	} else {
++
++		if (max9286_data->running) {
++			/* Disable CSI Output */
++			max9286_write_reg(max9286_data, 0x15, 0x03);
++		}
++		max9286_data->running--;
++	}
++
++	return 0;
++}
++
++static int max9286_link_setup(struct media_entity *entity,
++			   const struct media_pad *local,
++			   const struct media_pad *remote, u32 flags)
++{
++	return 0;
++}
++
++static const struct v4l2_subdev_pad_ops max9286_pad_ops = {
++	.enum_mbus_code		= max9286_enum_mbus_code,
++	.enum_frame_size	= max9286_enum_framesizes,
++	.enum_frame_interval	= max9286_enum_frame_interval,
++	.get_fmt		= max9286_get_fmt,
++	.set_fmt		= max9286_set_fmt,
++	.get_frame_desc		= max9286_get_frame_desc,
++	.set_frame_desc		= max9286_set_frame_desc,
++};
++
++static const struct v4l2_subdev_core_ops max9286_core_ops = {
++	.s_power	= max9286_set_power,
++};
++
++static const struct v4l2_subdev_video_ops max9286_video_ops = {
++	.s_parm =	max9286_s_parm,
++	.g_parm =	max9286_g_parm,
++	.s_stream		= max9286_s_stream,
++};
++
++static const struct v4l2_subdev_ops max9286_subdev_ops = {
++	.core	= &max9286_core_ops,
++	.pad	= &max9286_pad_ops,
++	.video	= &max9286_video_ops,
++};
++
++static const struct media_entity_operations max9286_sd_media_ops = {
++	.link_setup = max9286_link_setup,
++};
++
++ssize_t analog_show(struct device *dev,
++			struct device_attribute *attr, char *buf)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct sensor_data *max9286_data = subdev_to_sensor_data(sd);
++	u16 val = 0;
++
++	ar0144_read_reg(max9286_data, 0, 0x3070, &val);
++	return sprintf(buf, "%s\n", (val & 0x2) ? "enabled" : "disabled");
++}
++
++static ssize_t analog_store(struct device *dev,
++			struct device_attribute *attr, const char *buf, size_t count)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct sensor_data *max9286_data = subdev_to_sensor_data(sd);
++	char enabled[32];
++
++	if (sscanf(buf, "%s", enabled) > 0) {
++		if (strcmp(enabled, "2") == 0)
++			ar0144_write_reg(max9286_data, 0, 0x3070, 0x2);
++		else if (strcmp(enabled, "1") == 0)
++			ar0144_write_reg(max9286_data, 0, 0x3070, 0x1);
++		else if (strcmp(enabled, "3") == 0)
++			ar0144_write_reg(max9286_data, 0, 0x3070, 0x3);
++		else
++			ar0144_write_reg(max9286_data, 0, 0x3070, 0x0);
++		return count;
++	}
++	return -EINVAL;
++}
++
++static DEVICE_ATTR(analog_test_pattern, 0644, analog_show, analog_store);
++
++/*!
++ * max9286 I2C probe function
++ *
++ * @param adapter            struct i2c_adapter *
++ * @return  Error code indicating success or failure
++ */
++static int max9286_probe(struct i2c_client *client,
++		const struct i2c_device_id *id)
++{
++	struct device *dev = &client->dev;
++	struct sensor_data *max9286_data;
++	struct v4l2_subdev *sd;
++	int retval;
++
++	max9286_data = devm_kzalloc(dev, sizeof(*max9286_data), GFP_KERNEL);
++	if (!max9286_data)
++		return -ENOMEM;
++
++	/* Set initial values for the sensor struct. */
++	max9286_data->sensor_clk = devm_clk_get(dev, "capture_mclk");
++	if (IS_ERR(max9286_data->sensor_clk)) {
++		/* assuming clock enabled by default */
++		max9286_data->sensor_clk = NULL;
++		dev_err(dev, "clock-frequency missing or invalid\n");
++		return PTR_ERR(max9286_data->sensor_clk);
++	}
++
++	retval = of_property_read_u32(dev->of_node, "mclk",
++		&(max9286_data->mclk));
++	if (retval) {
++		dev_err(dev, "mclk missing or invalid\n");
++		return retval;
++	}
++
++	retval = of_property_read_u32(dev->of_node, "mclk_source",
++		(u32 *)&(max9286_data->mclk_source));
++	if (retval) {
++		dev_err(dev, "mclk_source missing or invalid\n");
++		return retval;
++	}
++
++	/* request power down pin */
++	max9286_data->pwn_gpio = of_get_named_gpio(dev->of_node, "pwn-gpios", 0);
++	if (!gpio_is_valid(max9286_data->pwn_gpio)) {
++		dev_err(dev, "no sensor pwdn pin available\n");
++		return -ENODEV;
++	}
++	retval = devm_gpio_request_one(dev, max9286_data->pwn_gpio, GPIOF_OUT_INIT_HIGH,
++					"max9286_pwd");
++	if (retval < 0)
++		return retval;
++
++	max9286_hw_reset(max9286_data);
++
++	clk_prepare_enable(max9286_data->sensor_clk);
++
++	max9286_data->i2c_client = client;
++	/* max9286_data->format.code = MEDIA_BUS_FMT_Y12_1X12; */
++	max9286_data->format.code = MEDIA_BUS_FMT_Y12_1X12;
++	max9286_data->format.width = ar0144_mode_info_data[0][0].width;
++	max9286_data->format.height = ar0144_mode_info_data[0][0].height;
++	max9286_data->format.colorspace = V4L2_COLORSPACE_JPEG;
++	/*****************************************
++	 * Pass mipi phy clock rate Mbps
++	 * fcsi2 = PCLk * WIDTH * CHANNELS / LANES
++	 * fsci2 = 72MPCLK * 8 bit * 4 channels / 4 lanes
++	 ****************************************/
++	max9286_data->format.reserved[0] = 72 * 8;
++	max9286_data->format.field = V4L2_FIELD_NONE;
++	max9286_data->streamcap.capturemode = 0;
++	max9286_data->streamcap.timeperframe.denominator = 30;
++	max9286_data->streamcap.timeperframe.numerator = 1;
++	max9286_data->is_mipi = 1;
++
++	retval = max9286_read_reg(max9286_data, 0x1e);
++	if (retval != 0x40) {
++		pr_warning("max9286 is not found, chip id reg 0x1e = 0x%x.\n", retval);
++		clk_disable_unprepare(max9286_data->sensor_clk);
++		devm_gpio_free(dev, max9286_data->pwn_gpio);
++		return -ENODEV;
++	}
++
++	max9286_hardware_preinit(max9286_data);
++
++	if  (max9286_data->sensor_num == 0) {
++		pr_warning("cameras are not found,\n");
++		clk_disable_unprepare(max9286_data->sensor_clk);
++		devm_gpio_free(dev, max9286_data->pwn_gpio);
++		return -ENODEV;
++	}
++
++	/* return 0; */
++
++	max9286_data->streamcap.capability = V4L2_CAP_TIMEPERFRAME;
++	max9286_data->streamcap.timeperframe.denominator = 30;
++	max9286_data->streamcap.timeperframe.numerator = 1;
++	max9286_data->v_channel = 0;
++	max9286_data->cap_mode.clip_top = 0;
++	max9286_data->cap_mode.clip_left = 0;
++
++	max9286_data->cap_mode.clip_height = 800;
++	max9286_data->cap_mode.clip_width = 1280;
++
++	max9286_data->cap_mode.hlen = max9286_data->cap_mode.clip_width;
++
++	max9286_data->cap_mode.hfp = 0;
++	max9286_data->cap_mode.hbp = 0;
++	max9286_data->cap_mode.hsync = 625;
++	max9286_data->cap_mode.vlen = 800;
++	max9286_data->cap_mode.vfp = 0;
++	max9286_data->cap_mode.vbp = 0;
++	max9286_data->cap_mode.vsync = 40;
++	max9286_data->cap_mode.vlen1 = 0;
++	max9286_data->cap_mode.vfp1 = 0;
++	max9286_data->cap_mode.vbp1 = 0;
++	max9286_data->cap_mode.vsync1 = 0;
++	max9286_data->cap_mode.pixelclock = 27000000;
++
++	sd = &max9286_data->subdev;
++	v4l2_i2c_subdev_init(sd, client, &max9286_subdev_ops);
++	sd->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++
++	sd->entity.function = MEDIA_ENT_F_CAM_SENSOR;
++	max9286_data->pads[MIPI_CSI2_SENS_VC0_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
++	max9286_data->pads[MIPI_CSI2_SENS_VC1_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
++	max9286_data->pads[MIPI_CSI2_SENS_VC2_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
++	max9286_data->pads[MIPI_CSI2_SENS_VC3_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
++	retval = media_entity_pads_init(&sd->entity, MIPI_CSI2_SENS_VCX_PADS_NUM,
++							max9286_data->pads);
++	if (retval < 0)
++		return retval;
++
++	max9286_data->subdev.entity.ops = &max9286_sd_media_ops;
++	retval = v4l2_async_register_subdev(&max9286_data->subdev);
++	if (retval < 0) {
++		dev_err(&client->dev,
++					"%s--Async register failed, ret=%d\n", __func__, retval);
++		media_entity_cleanup(&sd->entity);
++	}
++
++	retval = max9286_hardware_init(max9286_data);
++	if (retval < 0) {
++		dev_err(&client->dev, "camera init failed\n");
++		clk_disable_unprepare(max9286_data->sensor_clk);
++		media_entity_cleanup(&sd->entity);
++		v4l2_async_unregister_subdev(sd);
++		return retval;
++	}
++
++	max9286_data->running = 0;
++
++	/* Disable CSI Output */
++	max9286_write_reg(max9286_data, 0x15, 0x03);
++
++	/*Create device attr in sys */
++	retval = device_create_file(&client->dev, &dev_attr_analog_test_pattern);
++	if (retval < 0) {
++		dev_err(&client->dev, "%s: create device file fail\n", __func__);
++		return retval;
++	}
++
++	dev_info(&max9286_data->i2c_client->dev,
++			"max9286_mipi is found, name %s\n", sd->name);
++	return retval;
++}
++
++/*!
++ * max9286 I2C detach function
++ *
++ * @param client            struct i2c_client *
++ * @return  Error code indicating success or failure
++ */
++static int max9286_remove(struct i2c_client *client)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct sensor_data *max9286_data = subdev_to_sensor_data(sd);
++
++	clk_disable_unprepare(max9286_data->sensor_clk);
++	device_remove_file(&client->dev, &dev_attr_analog_test_pattern);
++	media_entity_cleanup(&sd->entity);
++	v4l2_async_unregister_subdev(sd);
++
++	return 0;
++}
++static const struct i2c_device_id max9286_id[] = {
++	{},
++};
++
++MODULE_DEVICE_TABLE(i2c, max9286_id);
++
++static const struct of_device_id max9286_of_match[] = {
++	{ .compatible = "maxim,max9286_mipi" },
++	{ /* sentinel */ }
++};
++
++static struct i2c_driver max9286_i2c_driver = {
++	.driver = {
++		.owner = THIS_MODULE,
++		.name   = "max9286_mipi",
++		.of_match_table	= of_match_ptr(max9286_of_match),
++	},
++	.probe  = max9286_probe,
++	.remove = max9286_remove,
++	.id_table = max9286_id,
++};
++
++module_i2c_driver(max9286_i2c_driver);
++
++MODULE_AUTHOR("Freescale Semiconductor, Inc.");
++MODULE_DESCRIPTION("MAX9286 GSML Deserializer Driver");
++MODULE_LICENSE("GPL");
++MODULE_VERSION("1.0");
++MODULE_ALIAS("CSI");
+diff --git a/drivers/media/platform/imx8/mxc-isi-cap.c b/drivers/media/platform/imx8/mxc-isi-cap.c
+index 16d43b6a786f..46fdb8fa7c8e 100644
+--- a/drivers/media/platform/imx8/mxc-isi-cap.c
++++ b/drivers/media/platform/imx8/mxc-isi-cap.c
+@@ -106,6 +106,14 @@ struct mxc_isi_fmt mxc_isi_out_formats[] = {
+ 		.memplanes	= 1,
+ 		.colplanes	= 1,
+ 		.mbus_code	= MEDIA_BUS_FMT_RGB888_1X24,
++	}, {
++		.name		= "Y12",
++		.fourcc		= V4L2_PIX_FMT_Y12,
++		.depth		= { 16 },
++		.color		= MXC_ISI_OUT_FMT_RAW16,
++		.memplanes	= 1,
++		.colplanes	= 1,
++		.mbus_code	= MEDIA_BUS_FMT_Y12_1X12,
+ 	}
+ };
+ 
+-- 
+2.21.0
+
